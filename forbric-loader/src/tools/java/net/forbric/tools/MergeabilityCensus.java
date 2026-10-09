@@ -80,9 +80,17 @@ public final class MergeabilityCensus {
 		Map<String, ClassNode> forge = load(args[1]);
 		Map<String, ClassNode> neo = load(args[2]);
 		List<String[]> conflicts = conflicts(Path.of(args[3]));
+		LostHookAttribution.Report dispositions = LostHookAttribution.report(Path.of(args[3]));
 		System.out.println("[mergeability] " + conflicts.size() + " dropped hook(s) to judge ("
 				+ conflicts.stream().filter(c -> c[2].equals("forge")).count() + " Forge, "
 				+ conflicts.stream().filter(c -> c[2].equals("neo")).count() + " NeoForge)");
+		// Denominator honesty: rows the report carries that are NOT dropped hooks are named, not silently
+		// skipped -- a restored hook is outside the question, an awaiting-facade pair is still dropped today.
+		System.out.println("[mergeability] report rows outside the dropped-hook question: facade-restored="
+				+ dispositions.facadeRestorations().size() + " (restored at merge time, not losses),"
+				+ " composable-awaiting-facade="
+				+ (dispositions.facadeCandidates().size() + dispositions.awaitingFacadePairs().size())
+				+ " pair(s) (still dropped today; their conflict rows remain in the count above)");
 
 		// ---- calibration ----
 		int calTotal = 0;
@@ -164,6 +172,8 @@ public final class MergeabilityCensus {
 	 * Every dropped-hook row, as {owner, name+desc, lost family}. Both families and both row forms, through the one
 	 * parser {@link LostHookAttribution} uses: this used to match {@code (forge hook lost)} alone, which dropped the
 	 * NeoForge losses and the field-init-kept rows, and the question "was it a choice" applies to all of them.
+	 * Facade-restored rows are not dropped hooks, so they stay out of this list; the same parse still stops the run
+	 * on any hook-disposition row form it does not recognise.
 	 */
 	static List<String[]> conflicts(Path report) throws IOException {
 		List<String[]> out = new ArrayList<>();

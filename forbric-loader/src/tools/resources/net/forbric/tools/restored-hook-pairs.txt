@@ -1,0 +1,25 @@
+# Copyright 2026 The Forbric Project. Licensed under the Apache License, Version 2.0.
+#
+# Restored hook pairs composed through the kernel's ComposedHook facade
+# (net.forbric.kernel.runtime.ComposedHook, forbric-kernel game-side runtime).
+#
+# Row format, one pair per line:
+#   <pairId> <neoOwner>.<neoName><neoDesc> <forgeOwner>.<forgeName><forgeDesc>
+#
+# - pairId names the facade method: a listed site's base-family call is
+#   retargeted to INVOKESTATIC net/forbric/kernel/runtime/ComposedHook.<pairId>
+#   with the SAME descriptor, and the other family's call is not inserted --
+#   the facade's runtime body performs BOTH hooks under its own dispatch scope,
+#   so a listed pair needs no REVIEWED_RESTORATIONS stand-down entry. pairId
+#   must be a plain method name: [A-Za-z_$][A-Za-z0-9_$]*.
+# - The base family's hook comes first (NeoForge), then the restored family's
+#   (MinecraftForge). v1 requires neoName == forgeName and neoDesc == forgeDesc,
+#   the same equality the paired-hooks grammar requires of the call sites.
+# - '#' comment lines and blank lines are ignored. Any malformed row fails the
+#   merge tool: a table it cannot read exactly restores nothing.
+# - Composition is all-or-nothing per method: it is refused unless EVERY paired
+#   site of the method maps to the SAME pairId (partial composition is unsafe).
+#
+# This increment ships the table EMPTY on purpose: the portal spawn pair stays
+# on the reviewed-restorations path, and real rows are enabled only after the
+# facade methods are reviewed against the staged game jars.

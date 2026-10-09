@@ -28,6 +28,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeSet;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -62,6 +63,17 @@ class KernelRuntimeClassesTest {
 	/** {@code net.forbric.kernel.runtime.Foo} or {@code net/forbric/kernel/runtime/Foo}, however it is spelled. */
 	private static final Pattern NAMED = Pattern.compile(
 			"net[./]forbric[./]kernel[./]runtime[./]((?:[a-z][A-Za-z0-9_]*[./])*[A-Z][A-Za-z0-9_$]*)");
+
+	/**
+	 * Registered names spelled only by the MERGE TOOLING in forbric-loader, which this module's tests cannot scan:
+	 * {@code AdditiveMethodMerger} retargets a restored pair's base call to {@code ComposedHook.<pairId>}, and the
+	 * manifest {@code ComposedHookManifest} reads is the resource {@code MergedBaseBuilder} embeds. The
+	 * correspondence is held by the merge tool's own tests. The set is pinned here so it cannot grow quietly —
+	 * anything else the boot side stops naming must fail the scan below, not be excused.
+	 */
+	private static final Set<String> SPELLED_BY_MERGE_TOOLING = Set.of(
+			"net.forbric.kernel.runtime.ComposedHook",
+			"net.forbric.kernel.runtime.ComposedHookManifest");
 
 	private static List<Path> javaFiles(Path root) throws Exception {
 		try (Stream<Path> walk = Files.walk(root)) {
@@ -104,11 +116,30 @@ class KernelRuntimeClassesTest {
 			while (m.find()) spelled.add("net.forbric.kernel.runtime." + m.group(1).replace('/', '.'));
 		}
 
-		List<String> stale = KernelRuntimeClasses.all().keySet().stream().filter(n -> !spelled.contains(n)).toList();
+		List<String> stale = KernelRuntimeClasses.all().keySet().stream()
+				.filter(n -> !spelled.contains(n) && !SPELLED_BY_MERGE_TOOLING.contains(n)).toList();
 
 		assertTrue(stale.isEmpty(), "the registry still lists game-side classes no boot-side code names — a "
 				+ "registry nobody is forced to update goes stale silently, which is the defect it exists to "
 				+ "prevent, one level up: " + stale);
+	}
+
+	/** The exemption is exact: registered (a typo here would silently un-exempt nothing), and not spelled (it leaves the moment boot code names the class). */
+	@Test
+	void theMergeToolingExemptionIsRegisteredAndUnspelled() throws Exception {
+		TreeSet<String> spelled = new TreeSet<>();
+		for (Path file : javaFiles(MAIN)) {
+			if (file.endsWith("KernelRuntimeClasses.java")) continue;
+			Matcher m = NAMED.matcher(Files.readString(file, StandardCharsets.UTF_8));
+			while (m.find()) spelled.add("net.forbric.kernel.runtime." + m.group(1).replace('/', '.'));
+		}
+
+		for (String name : SPELLED_BY_MERGE_TOOLING) {
+			assertTrue(KernelRuntimeClasses.all().containsKey(name),
+					name + " is exempt as spelled by the merge tooling but is not in the registry at all");
+			assertFalse(spelled.contains(name), name + " IS spelled by boot-side code now — take it off "
+					+ "SPELLED_BY_MERGE_TOOLING so the both-directions scan covers it again");
+		}
 	}
 
 	@Test

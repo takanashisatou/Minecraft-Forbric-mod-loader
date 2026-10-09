@@ -1273,3 +1273,54 @@ them turned up a loss every player had.
   veto now expects one Scarpet event. Its baseline fails exactly 16 Carpet checks and 0 base-fluid ones, and
   the fixed run passes 27/27 with no stale census row or line. The same gate on 67aede69 fails exactly the four
   native-order checks.
+
+## Neutral hook facade: composable-pair mechanism shipped with an empty pair table (2026-10-10)
+
+- Until now the paired-hooks grammar held every composable pair back behind `Context.reviewed`, whose audited
+  set names exactly the portal spawn pair, because restoring the Forge-side call without a runtime stand-down
+  makes the Neo→Forge event bridge deliver the event twice. This increment generalises the portal pilot into a
+  mechanism: the merge tool ships a pair table (the `net/forbric/tools/restored-hook-pairs.txt` classpath
+  resource), and a listed pair composes by retargeting each paired base call to
+  `INVOKESTATIC net/forbric/kernel/runtime/ComposedHook.<pairId>(<same descriptor>)` instead of inserting the
+  other side's call. The kernel's new `ComposedHook` facade (game-side runtime source set) performs both
+  families' hooks in the pilot's order — NeoForge's hook, the Optional refusal guard repeated, then
+  MinecraftForge's — inside a per-pair thread-local dispatch scope queried as `ComposedHook.inDispatch(pairId)`,
+  so the facade IS the stand-down and a listed pair never needs a `REVIEWED_RESTORATIONS` entry. Composition is
+  all-or-nothing per method: every paired site must map to the same pair id, and mixed or partial retargets are
+  refused by name. The entry-prefix grammar is unchanged in this increment.
+- The merged base jar now carries the ledger of what was composed: `MergedBaseBuilder` embeds a generated
+  `META-INF/forbric/restored-hooks.txt` (header comments plus one `<pairId> <host>#<name><desc> paired-facade`
+  row per composed site), and merge-conflicts.txt gains a machine-readable candidates section aggregating every
+  "paired hooks align, but no runtime stand-down is reviewed" refusal into one row per unmapped composable pair,
+  with its decline count and refusal hosts. The kernel reads the manifest back (`ComposedHookManifest`), and
+  `ComposedHook.verifySelf()` refuses a manifest that names a pair id this ComposedHook declares no facade
+  method for.
+- `LostHookAttribution` and `MergeabilityCensus` learned the new row forms deliberately, keeping the fail-closed
+  rule that an unrecognised hook-disposition row stops the run. A facade-restoration row —
+  `(forge hook restored via facade <pairId>)`, or the decision-log form
+  `ACCEPTED paired hooks restored via facade <pairId> (<n> site(s))` — counts as restored in a new category,
+  apart from direct runtime restoration: it is proved from the merged jar alone (the manifest must list the
+  site and the host body must invoke the facade), never from defined-class evidence, and a claim the jar does
+  not bear out stops the run; a host missing from the jar is unobserved, not a pass. A candidates-section row
+  is composable-but-awaiting-facade, also a new category — neither raw loss nor confirmed loss; the conflict
+  rows it accounts for are marked `AWAITING-FACADE` but remain real losses today. Section headers, `#` comment
+  lines and `[merge]` summary lines are not rows and are never examined.
+- The seed pair table ships EMPTY (comments only), so nothing changes on the real jars: the portal pair stays
+  on the existing `REVIEWED_RESTORATIONS` path (composed inline, with the PortalSpawn dispatch-scope
+  stand-down), every other composable pair stays declined, and with an empty table the merger's facade path
+  never fires. No real-jar acceptance is claimed for this increment: the dev machine has no staged game jars,
+  so no real merge was rerun and `AdditiveMethodMergerStagedTest` skips here.
+- Next steps, in order: on a jar-equipped machine, pick pairs from the report's candidates section, review each
+  pair's runtime double-delivery story, and add it to the pair table; wire the affected bridge listeners to
+  `ComposedHook.inDispatch(pairId)` so each bridge stands down for exactly the facade's dispatch (without that
+  listener-side wiring a facade-composed pair double-delivers — the reason the table ships empty); then rerun
+  the staged merge and regenerate the tracked fixtures.
+- Evidence: `LostHookAttributionTest` (26: both candidates-section row forms and both facade-restoration row
+  forms parsed, unrecognised forms of each stop the run, the aggregated `[merge]` summary lines are not
+  mistaken for rows, restoration proved against the merged jar and its manifest and refused when either
+  disagrees, awaiting-facade marking and the census announcement). `MergedBaseBuilderManifestTest` (7) runs the
+  real builder end-to-end and feeds its report and merged jar to the attribution's parsers. Loader tools
+  suites: 76 green (`AdditiveMethodMergerTest` 24, `MergedBaseAdditiveIntegrationTest` 6,
+  `EffectiveHookEvidenceTest` 11, `LinkBaselineProvenanceTest` 2, plus the two above), with
+  `AdditiveMethodMergerStagedTest`'s 4 skipped (staged jars absent). Kernel: `ComposedHookTest` and
+  `ComposedHookManifestTest` 17 green; `compileRuntimeJava` SKIPPED (staged game jars absent on this machine).

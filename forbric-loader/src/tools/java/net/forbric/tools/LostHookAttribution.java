@@ -25,6 +25,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -65,7 +66,22 @@ import org.objectweb.asm.tree.TypeInsnNode;
  * Raw losses are reported separately from runtime restoration. Restoration is assessed only when the kernel's
  * defined-class evidence is supplied, and then structurally ({@link EffectiveHookEvidence}), for the conflict rows
  * and for every raw loss in the census alike.
- * The appended platform census covers every direct platform method invocation in both patched JARs,
+ *
+ * <p>Two later row forms are classified apart from both raw loss and runtime restoration. A
+ * {@code (forge hook restored via facade <pairId>)} row — or the matching decision-log row,
+ * {@code ACCEPTED paired hooks restored via facade <pairId> (<n> site(s))} — names a method whose dropped hook
+ * the merge itself kept: the base's paired call was retargeted to {@code net/forbric/kernel/runtime/ComposedHook},
+ * whose method for the pair performs both families' calls. That is proved from the merged jar alone (the embedded
+ * {@code META-INF/forbric/restored-hooks.txt} row and the facade call in the host body), never from runtime
+ * evidence, so it counts as restored but separately from direct runtime restoration — and a claim the jar does
+ * not bear out stops the run rather than inheriting the restored label. The report's machine-readable
+ * candidates section names each pair whose {@code paired hooks align, but no runtime stand-down is reviewed}
+ * refusals were aggregated into it — as a {@code candidate <neoHook> <forgeHook> declines=<n> sites=…} row or a
+ * bare {@code <baseHook> -> <restoredHook>} pair key, both taught: composable but with no facade mapping yet,
+ * so the conflict rows it accounts for are marked AWAITING-FACADE and the pair counts as its own category —
+ * neither raw loss nor confirmed loss.
+ *
+ * <p>The appended platform census covers every direct platform method invocation in both patched JARs,
  * including non-conflict callers and symbols outside the event-facade model. It does not equate those
  * platform symbols with event hooks.
  *
@@ -104,9 +120,16 @@ public final class LostHookAttribution {
 		System.out.println("[attribution] mods name " + wanted.size()
 				+ " ecosystem class references (candidate filter; not event/subscriber count)");
 
-		int judged = 0, noHookFound = 0, unobserved = 0;
+		int judged = 0, noHookFound = 0, unobserved = 0, awaitingFacadeConflicts = 0;
 		List<String> candidates = new ArrayList<>(), trades = new ArrayList<>();
-		List<Conflict> conflicts = conflicts(Path.of(args[5]));
+		Report report = report(Path.of(args[5]));
+		List<Conflict> conflicts = report.conflicts();
+		// Candidates mark conflict rows two ways, one per row form: candidate rows name their refusal hosts
+		// exactly; bare pair-key rows name only the restored symbol (owner#name+desc, the RAW-LOST form).
+		Set<String> awaitingFacadeSites = new TreeSet<>();
+		for (FacadeCandidate candidate : report.facadeCandidates()) awaitingFacadeSites.addAll(candidate.sites());
+		Set<String> awaitingFacadeHooks = new TreeSet<>();
+		for (String symbol : report.awaitingFacadePairs()) awaitingFacadeHooks.add(hookHashForm(symbol));
 		for (Conflict c : conflicts) {
 			MethodNode f = method(forge.get(c.owner()), c.method());
 			MethodNode n = method(neo.get(c.owner()), c.method());
@@ -122,8 +145,14 @@ public final class LostHookAttribution {
 			if (lost.isEmpty()) { noHookFound++; continue; }
 			boolean gainWanted = anyWanted(lost, eventsOfHook, wanted);
 			boolean giveUpWanted = anyWanted(kept, eventsOfHook, wanted);
+			// A conflict the candidates section accounts for is marked, not reclassified: the raw loss is real
+			// today, but it awaits a facade mapping, not a whitelist trade.
+			boolean awaitingFacadePair = awaitingFacadeSites.contains(c.owner() + "#" + c.method())
+					|| lost.stream().anyMatch(awaitingFacadeHooks::contains);
+			if (awaitingFacadePair) awaitingFacadeConflicts++;
 			String row = c.owner() + "#" + c.method() + " lost-family=" + c.lostFamily()
-					+ (c.fieldInitKept() ? " kind=FIELD_INIT_KEPT" : "") + " RAW-LOST " + lost + " RETAINED " + kept;
+					+ (c.fieldInitKept() ? " kind=FIELD_INIT_KEPT" : "") + " RAW-LOST " + lost + " RETAINED " + kept
+					+ (awaitingFacadePair ? " AWAITING-FACADE" : "");
 			System.out.println("[attribution] " + row);
 			if (effective != null) for (String hook : lost) {
 				var state = effective.state(c.owner() + "#" + c.method(), hook);
@@ -149,6 +178,11 @@ public final class LostHookAttribution {
 					+ " is residual direct-call loss; reflection and other unmodelled routes remain unassessed."
 					+ " UNOBSERVED is not a pass.");
 		}
+		printFacadeRestorations(report.facadeRestorations(), merged, Path.of(args[2]));
+		System.out.println("[attribution] composable-awaiting-facade="
+				+ (report.facadeCandidates().size() + report.awaitingFacadePairs().size())
+				+ " pair(s), " + awaitingFacadeConflicts + " conflict row(s) marked AWAITING-FACADE: the paired grammar"
+				+ " aligned and only a facade mapping is missing; not raw loss, not confirmed loss");
 		System.out.println("[attribution] CANDIDATES (lost event referenced, no retained event reference observed): " + candidates.size());
 		for (String row : candidates) System.out.println("    + " + row);
 		System.out.println("[attribution] TRADES (both event types referenced): " + trades.size());
@@ -469,6 +503,36 @@ public final class LostHookAttribution {
 	}
 
 	/**
+	 * One method whose dropped hook the merge kept by composing the pair behind the kernel's
+	 * {@code ComposedHook} facade. {@code restoredFamily} names the side the arbitration would have lost; it is
+	 * null when only the decision-log form ({@code ACCEPTED paired hooks restored via facade ...}) names the
+	 * method, because that form does not say which side was restored.
+	 */
+	record FacadeRestoration(String owner, String method, String restoredFamily, String pairId) { }
+
+	/**
+	 * One unmapped composable pair from the report's machine-readable candidates section:
+	 * {@code candidate <neoHook> <forgeHook> declines=<n> sites=<host>#<name><desc>,…}. MergedBaseBuilder
+	 * aggregates one {@code paired hooks align, but no runtime stand-down is reviewed} refusal into this per
+	 * pair, neo hook first (the pair table's column order), so {@code declines} counts the refusal rows and
+	 * {@code sites} names their hosts. The pair awaits a row in the restored-hook pair table (and the stand-down
+	 * review that writes one), making it composable-but-awaiting-facade rather than a raw or confirmed loss.
+	 */
+	record FacadeCandidate(String neoHook, String forgeHook, int declines, List<String> sites) { }
+
+	/**
+	 * Every hook-disposition row of the report in one pass: losses, facade restorations and unmapped composable
+	 * pairs. The candidates section has two row forms — {@code candidate} rows (which feed
+	 * {@code facadeCandidates} with their decline counts and refusal hosts) and bare pair keys
+	 * {@code <baseHook> -> <restoredHook>} (which feed {@code awaitingFacadePairs} with the restored symbol in
+	 * {@code owner.name+desc} form; the pair key is base first, so the restored hook is the second field in every
+	 * orientation, base=forge rebases included). A real report carries one form or the other; both are taught so
+	 * neither is ever skipped past.
+	 */
+	record Report(List<Conflict> conflicts, List<FacadeRestoration> facadeRestorations,
+			List<FacadeCandidate> facadeCandidates, Set<String> awaitingFacadePairs) { }
+
+	/**
 	 * Both row forms MergedBaseBuilder writes. The plain one ends {@code (forge hook lost)}; the field-init one ends
 	 * {@code (kept neo body to preserve base-added field init; forge hook lost)}, and matching the plain suffix
 	 * alone dropped all six of those without a word -- LivingEntity's constructor, and with it onLivingMakeBrain,
@@ -477,19 +541,182 @@ public final class LostHookAttribution {
 	private static final Pattern CONFLICT_ROW = Pattern.compile(
 			"^([^\\s#]+)#(\\S+) \\((?:kept (forge|neo) body to preserve base-added field init; )?(forge|neo) hook lost\\)$");
 
+	/** The facade-composition row form: the hook the arbitration would have lost was restored at merge time. */
+	private static final Pattern FACADE_RESTORED_ROW = Pattern.compile(
+			"^([^\\s#]+)#(\\S+) \\((forge|neo) hook restored via facade ([^\\s)]+)\\)$");
+
+	/** The same restoration as a decision-log row; it does not name the restored family. */
+	private static final Pattern FACADE_ACCEPTED_DECISION = Pattern.compile(
+			"^([^\\s#]+)#(\\S+) ACCEPTED paired hooks restored via facade ([^\\s)]+) \\(\\d+ site\\(s\\)\\)$");
+
+	/** One candidates-section row: neo hook, forge hook, refusal count, refusal hosts. */
+	private static final Pattern FACADE_CANDIDATE_ROW = Pattern.compile(
+			"^candidate ([\\w/$]+\\.[\\w$]+\\([^)]*\\)\\S*) ([\\w/$]+\\.[\\w$]+\\([^)]*\\)\\S*)"
+					+ " declines=(\\d+) sites=(\\S+)$");
+
+	/** The candidates section's other row form: the bare pair key, {@code <baseHook> -> <restoredHook>}. */
+	private static final Pattern AWAITING_FACADE_PAIR_KEY = Pattern.compile(
+			"^([\\w/$]+\\.[\\w$]+\\([^)]*\\)\\S*) -> ([\\w/$]+\\.[\\w$]+\\([^)]*\\)\\S*)$");
+
 	static List<Conflict> conflicts(Path report) throws IOException {
-		List<Conflict> out = new ArrayList<>();
+		return report(report).conflicts();
+	}
+
+	/**
+	 * Parses every row that claims a hook disposition. A row the parser does not understand is a row the
+	 * denominator silently loses, so it stops the run: the next form MergedBaseBuilder learns to write has to be
+	 * taught here, not skipped here. That holds for the facade forms exactly as for the loss forms -- a line
+	 * naming a facade restoration or a candidates-section row in a shape nobody taught this parser fails the run
+	 * rather than dropping the row. Section headers ({@code === ...}), {@code #} comment lines (including the
+	 * {@code # declines=<n> sites=…} line beneath a bare pair key, which is prose for the human reader) and
+	 * {@code [merge]} summary lines are not rows and are never examined: the summary's aggregate lines
+	 * deliberately share phrases with the row forms. The DECLINED decision-log rows the candidates section
+	 * aggregates stay skipped as before, so no refusal is counted twice.
+	 */
+	static Report report(Path report) throws IOException {
+		List<Conflict> conflicts = new ArrayList<>();
+		Map<String, FacadeRestoration> restorations = new LinkedHashMap<>();
+		List<FacadeCandidate> candidates = new ArrayList<>();
+		Set<String> pairRows = new HashSet<>();
+		Set<String> awaiting = new LinkedHashSet<>();
 		for (String line : Files.readAllLines(report, StandardCharsets.UTF_8)) {
-			if (!line.trim().endsWith("hook lost)")) continue;
-			// A row the parser does not understand is a row the denominator silently loses, so it stops the run:
-			// the next form MergedBaseBuilder learns to write has to be taught here, not skipped here.
-			Matcher row = CONFLICT_ROW.matcher(line.trim());
-			if (!row.matches()) throw new IOException("unrecognised hook-lost row in " + report + ": " + line);
-			String kept = row.group(3), lost = row.group(4);
-			if (kept != null && kept.equals(lost)) throw new IOException("row keeps and loses the same side: " + line);
-			out.add(new Conflict(row.group(1), row.group(2), lost, kept != null));
+			line = line.trim();
+			if (line.startsWith("===") || line.startsWith("#") || line.startsWith("[merge]")) continue;
+			if (line.endsWith("hook lost)")) {
+				Matcher row = CONFLICT_ROW.matcher(line);
+				if (!row.matches()) throw new IOException("unrecognised hook-lost row in " + report + ": " + line);
+				String kept = row.group(3), lost = row.group(4);
+				if (kept != null && kept.equals(lost)) throw new IOException("row keeps and loses the same side: " + line);
+				conflicts.add(new Conflict(row.group(1), row.group(2), lost, kept != null));
+			} else if (line.contains("restored via facade")) {
+				// Both the disposition row ("(forge hook restored via facade …)") and the decision-log row
+				// ("ACCEPTED paired hooks restored via facade …") share only this phrase.
+				Matcher restored = FACADE_RESTORED_ROW.matcher(line);
+				Matcher accepted = FACADE_ACCEPTED_DECISION.matcher(line);
+				if (restored.matches()) {
+					// The disposition row is the richer form; a later decision-log duplicate must not erase it.
+					restorations.put(restored.group(1) + "#" + restored.group(2) + " " + restored.group(4),
+							new FacadeRestoration(restored.group(1), restored.group(2), restored.group(3), restored.group(4)));
+				} else if (accepted.matches()) {
+					restorations.putIfAbsent(accepted.group(1) + "#" + accepted.group(2) + " " + accepted.group(3),
+							new FacadeRestoration(accepted.group(1), accepted.group(2), null, accepted.group(3)));
+				} else {
+					throw new IOException("unrecognised facade-restoration row in " + report + ": " + line);
+				}
+			} else if (line.startsWith("candidate ")) {
+				Matcher candidate = FACADE_CANDIDATE_ROW.matcher(line);
+				if (!candidate.matches()) throw new IOException("unrecognised facade-candidate row in " + report + ": " + line);
+				if (!pairRows.add(candidate.group(1) + " " + candidate.group(2))) {
+					throw new IOException("facade candidate listed twice in " + report + ": " + line);
+				}
+				List<String> sites = List.of(candidate.group(4).split(","));
+				for (String site : sites) {
+					if (!site.contains("#")) throw new IOException("facade-candidate row names a non-host site in "
+							+ report + ": " + line);
+				}
+				candidates.add(new FacadeCandidate(candidate.group(1), candidate.group(2),
+						Integer.parseInt(candidate.group(3)), sites));
+			} else if (line.contains(" -> ")) {
+				Matcher pairKey = AWAITING_FACADE_PAIR_KEY.matcher(line);
+				if (!pairKey.matches()) throw new IOException("unrecognised pair-key row in " + report + ": " + line);
+				if (!pairRows.add(pairKey.group(1) + " " + pairKey.group(2))) {
+					throw new IOException("facade candidate listed twice in " + report + ": " + line);
+				}
+				awaiting.add(pairKey.group(2));
+			}
 		}
-		return out;
+		return new Report(List.copyOf(conflicts), List.copyOf(restorations.values()), List.copyOf(candidates),
+				Set.copyOf(awaiting));
+	}
+
+	/** The {@code owner#name+desc} form of a pair key's {@code owner.name+desc} symbol. */
+	private static String hookHashForm(String symbol) {
+		int dot = symbol.indexOf('.');
+		return dot < 0 ? symbol : symbol.substring(0, dot) + "#" + symbol.substring(dot + 1);
+	}
+
+	/**
+	 * The merged base's own ledger of facade-composed sites: the rows of its embedded
+	 * {@code META-INF/forbric/restored-hooks.txt}, each {@code <pairId> <host>#<name><desc> paired-facade},
+	 * returned as {@code <pairId> <host>#<name><desc>}. Null when the jar carries no such resource at all.
+	 * Blank lines and {@code #} comments (the header) are skipped; any other row shape stops the run, because a
+	 * manifest this parser cannot read cannot vouch for the claims checked against it.
+	 */
+	static Set<String> restoredHookManifest(Path mergedJar) throws IOException {
+		try (ZipFile zf = new ZipFile(mergedJar.toFile())) {
+			ZipEntry entry = zf.getEntry("META-INF/forbric/restored-hooks.txt");
+			if (entry == null) return null;
+			Set<String> rows = new LinkedHashSet<>();
+			try (InputStream in = zf.getInputStream(entry)) {
+				for (String raw : new String(in.readAllBytes(), StandardCharsets.UTF_8).lines().toList()) {
+					String line = raw.trim();
+					if (line.isEmpty() || line.startsWith("#")) continue;
+					String[] parts = line.split("\\s+");
+					if (parts.length != 3 || !parts[1].contains("#") || !parts[2].equals("paired-facade")) {
+						throw new IOException("unrecognised restored-hooks manifest row in " + mergedJar + ": " + raw);
+					}
+					if (!rows.add(parts[0] + " " + parts[1])) {
+						throw new IOException("duplicate restored-hooks manifest row in " + mergedJar + ": " + raw);
+					}
+				}
+			}
+			return rows;
+		}
+	}
+
+	/** Whether the merged host body invokes the facade method of {@code pairId}. */
+	private static boolean callsFacade(MethodNode host, String pairId) {
+		if (host.instructions == null) return false;
+		for (AbstractInsnNode insn : host.instructions) {
+			if (insn instanceof MethodInsnNode call && call.getOpcode() == Opcodes.INVOKESTATIC
+					&& call.owner.equals("net/forbric/kernel/runtime/ComposedHook") && call.name.equals(pairId)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Facade restorations are proved from the merged jar, not from runtime evidence: the report's claim must be
+	 * listed in the jar's restored-hooks manifest, and the host body must invoke the facade. A claim either check
+	 * contradicts stops the run -- calling it restored anyway would inflate the restored count on a report row's
+	 * word alone. A host missing from the merged jar is unobserved, exactly as for conflict rows.
+	 */
+	private static void printFacadeRestorations(List<FacadeRestoration> restorations, Map<String, ClassNode> merged,
+			Path mergedJar) throws IOException {
+		int restored = 0, unobserved = 0;
+		Set<String> manifest = null;
+		for (FacadeRestoration r : restorations) {
+			String host = r.owner() + "#" + r.method();
+			String family = r.restoredFamily() == null ? "" : " restored-family=" + r.restoredFamily();
+			MethodNode m = method(merged.get(r.owner()), r.method());
+			if (m == null) {
+				unobserved++;
+				System.out.println("[attribution] " + host + family + " FACADE-UNOBSERVED pair=" + r.pairId()
+						+ " (host missing from the merged jar; not a pass)");
+				continue;
+			}
+			if (manifest == null) {
+				manifest = restoredHookManifest(mergedJar);
+				if (manifest == null) {
+					throw new IOException("the report claims facade restorations but " + mergedJar
+							+ " carries no META-INF/forbric/restored-hooks.txt");
+				}
+			}
+			if (!manifest.contains(r.pairId() + " " + host)) {
+				throw new IOException("facade restoration not listed in META-INF/forbric/restored-hooks.txt of "
+						+ mergedJar + ": " + r.pairId() + " " + host);
+			}
+			if (!callsFacade(m, r.pairId())) {
+				throw new IOException("merged body makes no ComposedHook." + r.pairId() + " call: " + host);
+			}
+			restored++;
+			System.out.println("[attribution] " + host + family + " FACADE-RESTORED pair=" + r.pairId()
+					+ " (manifest-listed, ComposedHook call present in the merged body)");
+		}
+		System.out.println("[attribution] restored-via-facade=" + restored + " unobserved=" + unobserved
+				+ " (merge-time composition behind net/forbric/kernel/runtime/ComposedHook, proved from the merged jar;"
+				+ " no defined-class evidence needed, and counted apart from runtime restoration)");
 	}
 
 	private static Map<String, ClassNode> load(String jar, String label) throws IOException {

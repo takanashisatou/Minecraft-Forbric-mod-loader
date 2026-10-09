@@ -6,6 +6,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -38,9 +39,21 @@ import org.objectweb.asm.tree.*;
  * other kept is refused (one side replaced vanilla behaviour its hook now performs), and so are hooks the two
  * families post at different points of the vanilla computation (fall damage is the reference counterexample).
  *
- * <p>Composition also needs two answers from outside the method: the restored call must link in the merged
- * output, and the runtime's compensation for the loss it repairs must stand down on structural proof, or the
- * restored hook and that compensation post the same event twice. See {@link Context}.
+ * <p>Composition also needs answers from outside the method: a restored call must link in the merged output,
+ * and the runtime's compensation for the loss it repairs must stand down on structural proof, or the restored
+ * hook and that compensation post the same event twice. See {@link Context}.
+ *
+ * <p>A paired site can instead compose through the kernel's {@code ComposedHook} facade: when the pair table
+ * (the {@code net/forbric/tools/restored-hook-pairs.txt} classpath resource, see {@link HookPairs}) lists the
+ * base call against the other side's call, the base's call is RETARGETED to
+ * {@code INVOKESTATIC net/forbric/kernel/runtime/ComposedHook.<pairId>} with the same descriptor and the other
+ * side's call is not inserted at all. The facade's runtime body performs both hooks under its own dispatch
+ * scope, so the facade IS the stand-down and no reviewed restoration is asked for; the retarget links because
+ * the kernel runtime ships with the game and the link checker ignores owners outside the merged jar (the
+ * custom-payload interop precedent in MergedBaseBuilder). Composition is all-or-nothing: every paired site of
+ * the method must map to the SAME pair id. A partial retarget would leave the unmapped sites' bridge forwards
+ * delivering the events their direct restoration now posts, and two ids would mean sites written for different
+ * hooks, so both are refused by name.
  *
  * <p>This establishes bytecode composition invariants, NOT commutativity of mod side effects: hooks can still
  * throw or mutate their arguments. Functional tests remain necessary.
@@ -53,7 +66,10 @@ final class AdditiveMethodMerger {
 		boolean accepted() { return method != null; }
 	}
 
-	/** What a composition needs to know about the jar it is written into; both answers are required. */
+	/**
+	 * What a composition needs to know about the jar it is written into. Linkage and the reviewed stand-down
+	 * are required answers; {@link #facadePair} defaults to "not listed", the answer of every table-free caller.
+	 */
 	interface Context {
 		/** A static method with exactly this owner, name and descriptor exists in the merged output or its runtimes. */
 		boolean resolvesStatic(String owner, String name, String descriptor);
@@ -64,6 +80,15 @@ final class AdditiveMethodMerger {
 		 * in every runtime configuration, including the repair's own off switch, since the base cannot see either.
 		 */
 		boolean reviewed(MethodInsnNode alongside, MethodInsnNode restored);
+
+		/**
+		 * The pair id the restored-hook pair table lists for {@code restored} composed after {@code alongside}
+		 * (the base's own paired call), or null when the pair is not listed. A listed pair composes through the
+		 * kernel's ComposedHook facade (see the class javadoc), whose dispatch scope IS the stand-down, so a
+		 * listed pair never reaches {@link #reviewed}. Consulted only by the paired grammar, never for entry
+		 * prefixes: an entry prefix has no base-side call to retarget.
+		 */
+		default String facadePair(MethodInsnNode alongside, MethodInsnNode restored) { return null; }
 	}
 
 	private static final String PORTAL_HOOK = "onTrySpawnPortal(Lnet/minecraft/world/level/LevelAccessor;"
@@ -75,7 +100,8 @@ final class AdditiveMethodMerger {
 	 * (NeoForge's call, its nonempty guard repeated, then MinecraftForge's) and then limits the legacy forward to
 	 * that NeoForge dispatch; switched off with -Dforbric.portalSpawn=off, it removes the restored call again and
 	 * leaves Forge to the forward alone. No other bridge or repair has such a stand-down yet, so every other
-	 * composable pair is held back with a reason rather than restored into a double delivery.
+	 * composable pair is held back with a reason rather than restored into a double delivery — unless it is
+	 * listed in the restored-hook pair table, whose facade composition carries its own stand-down ({@link HookPairs}).
 	 */
 	static final Set<String> REVIEWED_RESTORATIONS = Set.of(
 			"net/neoforged/neoforge/event/EventHooks." + PORTAL_HOOK
@@ -86,8 +112,95 @@ final class AdditiveMethodMerger {
 				+ " -> " + restored.owner + "." + restored.name + restored.desc;
 	}
 
+	/**
+	 * The facade a listed pair's base call is retargeted to: {@code INVOKESTATIC} on this owner, the pair id as
+	 * the method name, the pair's shared descriptor unchanged. The class ships in the kernel's game-side
+	 * runtime, so the merged base may reference it the same way MergedBaseBuilder's custom-payload interop
+	 * retarget references net/forbric/**: the link checker ignores owners that are not merged-jar classes.
+	 */
+	static final String COMPOSED_HOOK_FACADE = "net/forbric/kernel/runtime/ComposedHook";
+
+	/**
+	 * The facade-composed hook pairs the merge tool knows, parsed from the classpath resource
+	 * {@code net/forbric/tools/restored-hook-pairs.txt}: one row per pair,
+	 * {@code <pairId> <neoOwner>.<neoName><neoDesc> <forgeOwner>.<forgeName><forgeDesc>}, {@code #} comments and
+	 * blank lines ignored. The immutable map is keyed {@code "<baseHook> -> <otherHook>"} — the base family's
+	 * call first, the restored family's second, the same shape {@link #restorationKey} reports — and yields the
+	 * pair id, which the kernel implements as {@code ComposedHook.<pairId>}.
+	 *
+	 * <p>Parsing fails closed: a row that is not exactly three fields, a hook that is not owner.name+desc, a
+	 * pair id that is not a plain method name, names or descriptors that differ between the two families (the
+	 * paired grammar requires them equal, so the table does too), and pairs or ids listed twice are all
+	 * rejected. A table the tool cannot read exactly must restore nothing rather than something unintended.
+	 */
+	static final class HookPairs {
+		/** No pairs: every facade answer is null, and composition falls through to the reviewed refusal. */
+		static final HookPairs NONE = new HookPairs(Map.of());
+
+		private final Map<String, String> pairIds;
+
+		private HookPairs(Map<String, String> pairIds) { this.pairIds = pairIds; }
+
+		boolean isEmpty() { return pairIds.isEmpty(); }
+
+		/** The id the pair {@code baseHook -> otherHook} (each owner.name+desc) is listed under, or null. */
+		String pairId(String baseHook, String otherHook) {
+			return pairIds.get(baseHook + " -> " + otherHook);
+		}
+
+		static HookPairs parse(List<String> lines) {
+			Map<String, String> pairIds = new LinkedHashMap<>();
+			Set<String> ids = new HashSet<>();
+			for (int row = 0; row < lines.size(); row++) {
+				String line = lines.get(row).trim();
+				if (line.isEmpty() || line.startsWith("#")) continue;
+				String[] fields = line.split("\\s+");
+				if (fields.length != 3) {
+					throw new IllegalArgumentException("restored-hook-pairs.txt row " + (row + 1)
+							+ ": expected '<pairId> <neoHook> <forgeHook>', got: " + line);
+				}
+				String pairId = fields[0];
+				if (!pairId.matches("[A-Za-z_$][A-Za-z0-9_$]*")) {
+					throw new IllegalArgumentException("restored-hook-pairs.txt row " + (row + 1)
+							+ ": pair id becomes ComposedHook.<pairId>, so it must be a plain method name: " + pairId);
+				}
+				String[] neo = hookRef(fields[1], row), forge = hookRef(fields[2], row);
+				if (!neo[1].equals(forge[1]) || !neo[2].equals(forge[2])) {
+					throw new IllegalArgumentException("restored-hook-pairs.txt row " + (row + 1)
+							+ ": the paired grammar requires equal names and descriptors, but " + fields[1]
+							+ " and " + fields[2] + " differ");
+				}
+				if (!ids.add(pairId)) {
+					throw new IllegalArgumentException("restored-hook-pairs.txt row " + (row + 1)
+							+ ": pair id " + pairId + " is listed twice");
+				}
+				if (pairIds.put(fields[1] + " -> " + fields[2], pairId) != null) {
+					throw new IllegalArgumentException("restored-hook-pairs.txt row " + (row + 1)
+							+ ": the pair " + fields[1] + " -> " + fields[2] + " is listed twice");
+				}
+			}
+			return new HookPairs(Map.copyOf(pairIds));
+		}
+
+		/** Splits {@code owner.name+desc} into {owner, name, desc}, rejecting anything else. */
+		private static String[] hookRef(String spec, int row) {
+			int parens = spec.indexOf('(');
+			int dot = parens < 0 ? -1 : spec.lastIndexOf('.', parens);
+			if (dot <= 0 || dot + 1 == parens || !spec.contains(")")) {
+				throw new IllegalArgumentException("restored-hook-pairs.txt row " + (row + 1)
+						+ ": not owner.name+desc: " + spec);
+			}
+			return new String[] { spec.substring(0, dot), spec.substring(dot + 1, parens), spec.substring(parens) };
+		}
+	}
+
 	/** Resolves hook owners, on demand, from the first of {@code classSets} that holds them. */
 	static Context context(List<Map<String, byte[]>> classSets, Set<String> reviewed) {
+		return context(classSets, reviewed, HookPairs.NONE);
+	}
+
+	/** As {@link #context(List, Set)}, additionally answering facade pairs from the parsed pair table. */
+	static Context context(List<Map<String, byte[]>> classSets, Set<String> reviewed, HookPairs pairs) {
 		Map<String, Set<String>> statics = new HashMap<>();
 		return new Context() {
 			@Override public boolean resolvesStatic(String owner, String name, String descriptor) {
@@ -107,6 +220,12 @@ final class AdditiveMethodMerger {
 
 			@Override public boolean reviewed(MethodInsnNode alongside, MethodInsnNode restored) {
 				return reviewed.contains(restorationKey(alongside, restored));
+			}
+
+			@Override public String facadePair(MethodInsnNode alongside, MethodInsnNode restored) {
+				return alongside == null ? null
+						: pairs.pairId(alongside.owner + "." + alongside.name + alongside.desc,
+								restored.owner + "." + restored.name + restored.desc);
 			}
 		};
 	}
@@ -500,6 +619,46 @@ final class AdditiveMethodMerger {
 					return refused("paired hook does not resolve: " + call.owner + "." + call.name + call.desc);
 				}
 			}
+		}
+		// A listed facade pair is restored before review is consulted: ComposedHook performs both hooks under
+		// its own dispatch scope, which IS the stand-down. All-or-nothing per method, though — retargeting only
+		// the listed sites would leave each unmapped site's direct restoration (had review allowed it) posting
+		// beside a bridge forward that never sees the facade's scope, and two ids in one method would retarget
+		// sites to facade methods written for a different pair. Both are refused by name.
+		String facadeId = null;
+		MethodInsnNode unmapped = null;
+		for (int index : pairs) {
+			String id = context.facadePair((MethodInsnNode) baseCode.get(index), (MethodInsnNode) otherCode.get(index));
+			if (id == null) {
+				if (unmapped == null) unmapped = (MethodInsnNode) baseCode.get(index);
+			} else if (facadeId == null) facadeId = id;
+			else if (!facadeId.equals(id)) {
+				return refused("paired hook facade composition is mixed: " + facadeId + " and " + id
+						+ " in one method; a method composes under one facade pair or none");
+			}
+		}
+		if (facadeId != null && unmapped != null) {
+			return refused("paired hook facade composition is partial: " + unmapped.owner + "." + unmapped.name
+					+ unmapped.desc + " is not in the pair table, and retargeting only the listed site(s) would "
+					+ "deliver the other family's event twice");
+		}
+		if (facadeId != null) {
+			// The base body IS the composed body: guards, branches and handler ranges stand, and each paired
+			// base call becomes INVOKESTATIC ComposedHook.<facadeId> with the same descriptor. None of the
+			// other side is inserted — the facade invokes both families itself, in base-then-other order.
+			// maxStack is the base's own: the retargeted call takes and returns exactly what the base's did.
+			MethodNode merged = new MethodNode(Opcodes.ASM9, base.access, base.name, base.desc,
+					base.signature, base.exceptions.toArray(String[]::new));
+			base.accept(merged);
+			List<AbstractInsnNode> mergedCode = code(merged);
+			for (Site site : sites) {
+				MethodInsnNode call = (MethodInsnNode) mergedCode.get(site.call());
+				call.owner = COMPOSED_HOOK_FACADE;
+				call.name = facadeId;
+				call.itf = false;
+			}
+			return new Result(merged, "paired hooks restored via facade " + facadeId + " (" + sites.size()
+					+ " site(s))", pairs.size(), pairs.size());
 		}
 		for (int index : pairs) {
 			MethodInsnNode restored = (MethodInsnNode) otherCode.get(index);

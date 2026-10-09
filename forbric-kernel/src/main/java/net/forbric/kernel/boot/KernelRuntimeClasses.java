@@ -170,6 +170,13 @@ public final class KernelRuntimeClasses {
 		CLASSES.put("net.forbric.kernel.runtime.soak.ClientSoakController", new Entry(Origin.COMPILED,
 				List.of(new Call("onTick", void.class, Object.class))));
 		CLASSES.put("net.forbric.kernel.runtime.KernelPortalSpawn", new Entry(Origin.COMPILED, List.of()));
+		// The facade a restored hook pair is retargeted to, and the reader of the META-INF/forbric/restored-hooks.txt
+		// manifest the merged base carries. Spelled as STRINGS by the merge tooling in forbric-loader (AdditiveMethodMerger
+		// writes the INVOKESTATIC ComposedHook.<pairId>, MergedBaseBuilder embeds the manifest), not by any boot-side
+		// file — the same situation as KernelConfigPortBridge, one module over. KernelRuntimeClassesTest exempts exactly
+		// these two names from its both-directions scan; the correspondence is held by the merge tool's own tests.
+		CLASSES.put("net.forbric.kernel.runtime.ComposedHook", new Entry(Origin.COMPILED, List.of()));
+		CLASSES.put("net.forbric.kernel.runtime.ComposedHookManifest", new Entry(Origin.COMPILED, List.of()));
 		CLASSES.put(KernelTransferInterop.BRIDGE, new Entry(Origin.COMPILED, List.of(new Call("install", void.class))));
 		CLASSES.put(KernelTransferInterop.ISSUES, new Entry(Origin.COMPILED,
 				List.of(new Call("setReporter", void.class, java.util.function.Consumer.class))));

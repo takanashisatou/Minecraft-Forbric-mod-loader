@@ -3,7 +3,9 @@ package net.forbric.tools;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import java.io.InputStream;
 import java.lang.reflect.InvocationTargetException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -327,6 +329,201 @@ public class AdditiveMethodMergerTest {
 	}
 
 	@Test
+	void listedFacadePairsRetargetTheBaseCallToComposedHookAndInsertNothing() throws Exception {
+		MethodNode vanilla = arithmetic();
+		MethodNode base = paired(vanilla, NEO), other = paired(vanilla, FORGE);
+		AdditiveMethodMerger.HookPairs pairs = AdditiveMethodMerger.HookPairs.parse(
+				List.of("pairObserve " + NEO + ".observe(I)V " + FORGE + ".observe(I)V"));
+		byte[] beforeBase = classBytes("Example", base), beforeOther = classBytes("Example", other);
+		AdditiveMethodMerger.Result result = merge(vanilla, base, other, context(true, false, pairs));
+		assertTrue(result.accepted(), result.reason());
+		assertEquals("paired hooks restored via facade pairObserve (1 site(s))", result.reason());
+		// Exactly the base's body — its loads, the shared edit and every branch stand — with only the paired
+		// call retargeted; no call to either family's own hook remains, the facade performs both.
+		List<String> expected = shapes(base);
+		int call = expected.indexOf("INVOKESTATIC " + NEO + ".observe");
+		assertTrue(call >= 0, "the fixture's paired call: " + expected);
+		expected.set(call, "INVOKESTATIC " + AdditiveMethodMerger.COMPOSED_HOOK_FACADE + ".pairObserve");
+		assertEquals(expected, shapes(result.method()));
+		assertFalse(shapes(result.method()).toString().contains(FORGE), "the merge does not insert the other call");
+		assertArrayEquals(beforeBase, classBytes("Example", base));
+		assertArrayEquals(beforeOther, classBytes("Example", other));
+		OBSERVED.clear();
+		assertEquals(10, invokeFacade(result.method(), 3));
+		assertEquals(List.of(103, 203), OBSERVED);
+		// The facade IS the stand-down, so a reviewed entry changes nothing about the decision.
+		assertEquals(result.reason(),
+				merge(vanilla, paired(vanilla, NEO), paired(vanilla, FORGE), context(true, true, pairs)).reason());
+	}
+
+	@Test
+	void facadeCompositionRepeatsTheRefusalGuardBetweenFamiliesInsideTheFacade() throws Exception {
+		MethodNode vanilla = choosing();
+		AdditiveMethodMerger.HookPairs pairs = AdditiveMethodMerger.HookPairs.parse(List.of("pairFilter "
+				+ NEO + ".filter(Ljava/util/Optional;)Ljava/util/Optional; "
+				+ FORGE + ".filter(Ljava/util/Optional;)Ljava/util/Optional;"));
+		AdditiveMethodMerger.Result result = merge(vanilla, filtered(vanilla, NEO), filtered(vanilla, FORGE),
+				context(true, false, pairs));
+		assertTrue(result.accepted(), result.reason());
+		assertEquals("paired hooks restored via facade pairFilter (1 site(s))", result.reason());
+		// The base body stands — store, isPresent guard and branch included; only the call moved to the facade.
+		List<String> expected = shapes(filtered(vanilla, NEO));
+		expected.set(expected.indexOf("INVOKESTATIC " + NEO + ".filter"),
+				"INVOKESTATIC " + AdditiveMethodMerger.COMPOSED_HOOK_FACADE + ".pairFilter");
+		assertEquals(expected, shapes(result.method()));
+		byte[] bytes = classBytes("Example", result.method());
+		for (List<Integer> refusing : List.of(List.<Integer>of(), List.of(1), List.of(2))) {
+			try {
+				REFUSING.clear(); REFUSING.addAll(refusing); OBSERVED.clear();
+				assertEquals(refusing.isEmpty() ? 1 : 0, chooseFacade(bytes, Optional.of("portal")));
+				assertEquals(refusing.equals(List.of(1)) ? List.of(1) : List.of(1, 2), OBSERVED,
+						"the facade asks the second family only when the first did not refuse");
+			} finally {
+				REFUSING.clear();
+			}
+		}
+	}
+
+	@Test
+	void facadeCompositionKeepsTheOriginalExceptionRegionAroundTheFacadeCall() throws Exception {
+		MethodNode vanilla = divisionWithHandler();
+		AdditiveMethodMerger.HookPairs pairs = AdditiveMethodMerger.HookPairs.parse(
+				List.of("pairObserve " + NEO + ".observe(I)V " + FORGE + ".observe(I)V"));
+		AdditiveMethodMerger.Result result = merge(vanilla, paired(vanilla, NEO), paired(vanilla, FORGE),
+				context(true, false, pairs));
+		assertTrue(result.accepted(), result.reason());
+		assertEquals(1, result.method().tryCatchBlocks.size());
+		OBSERVED.clear();
+		assertEquals(5, invokeFacade(result.method(), 2));
+		assertEquals(-1, invokeFacade(result.method(), 0));
+		assertEquals(List.of(102, 202, 100, 200), OBSERVED);
+		try {
+			failHook = true;
+			OBSERVED.clear();
+			assertEquals(-1, invokeFacade(result.method(), 0), "a hook throwing inside the facade is caught by "
+					+ "the original handler, exactly where the base's own call would have thrown");
+			assertEquals(List.of(100), OBSERVED, "the first family's failure never reaches the second");
+		} finally {
+			failHook = false;
+		}
+	}
+
+	@Test
+	void everySiteOfOnePairInOneMethodIsRetargetedTogether() throws Exception {
+		MethodNode vanilla = arithmetic();
+		AdditiveMethodMerger.HookPairs pairs = AdditiveMethodMerger.HookPairs.parse(
+				List.of("pairObserve " + NEO + ".observe(I)V " + FORGE + ".observe(I)V"));
+		AdditiveMethodMerger.Result result = merge(vanilla, pairedTwice(vanilla, NEO), pairedTwice(vanilla, FORGE),
+				context(true, false, pairs));
+		assertTrue(result.accepted(), result.reason());
+		assertEquals("paired hooks restored via facade pairObserve (2 site(s))", result.reason());
+		int facadeCalls = 0;
+		for (AbstractInsnNode instruction : executable(result.method())) {
+			if (instruction instanceof MethodInsnNode call) {
+				assertEquals(AdditiveMethodMerger.COMPOSED_HOOK_FACADE, call.owner, "no family's own call remains");
+				assertEquals("pairObserve", call.name);
+				facadeCalls++;
+			}
+		}
+		assertEquals(2, facadeCalls);
+		OBSERVED.clear();
+		assertEquals(10, invokeFacade(result.method(), 3));
+		assertEquals(List.of(103, 203, 103, 203), OBSERVED);
+	}
+
+	@Test
+	void facadeCompositionIsRefusedUnlessEverySiteSharesOnePairId() {
+		MethodNode vanilla = arithmetic();
+		AdditiveMethodMerger.HookPairs onlyObserve = AdditiveMethodMerger.HookPairs.parse(
+				List.of("pairObserve " + NEO + ".observe(I)V " + FORGE + ".observe(I)V"));
+		AdditiveMethodMerger.HookPairs twoPairs = AdditiveMethodMerger.HookPairs.parse(List.of(
+				"pairObserve " + NEO + ".observe(I)V " + FORGE + ".observe(I)V",
+				"pairPeek " + NEO + ".peek(I)V " + FORGE + ".peek(I)V"));
+		// Review standing down changes nothing: the facade check runs first and partial composition is unsafe.
+		for (boolean reviewed : new boolean[] { false, true }) {
+			AdditiveMethodMerger.Result partial = merge(vanilla, pairedDistinct(vanilla, NEO), pairedDistinct(vanilla, FORGE),
+					context(true, reviewed, onlyObserve));
+			assertFalse(partial.accepted(), partial.reason());
+			assertTrue(partial.reason().startsWith("paired hook facade composition is partial: " + NEO + ".peek(I)V"),
+					partial.reason());
+			AdditiveMethodMerger.Result mixed = merge(vanilla, pairedDistinct(vanilla, NEO), pairedDistinct(vanilla, FORGE),
+					context(true, reviewed, twoPairs));
+			assertFalse(mixed.accepted(), mixed.reason());
+			assertTrue(mixed.reason().startsWith("paired hook facade composition is mixed: pairObserve and pairPeek"),
+					mixed.reason());
+		}
+	}
+
+	@Test
+	void pairsAbsentFromTheTableKeepTheReviewedRefusal() {
+		MethodNode vanilla = choosing();
+		String filter = ".filter(Ljava/util/Optional;)Ljava/util/Optional;";
+		for (AdditiveMethodMerger.HookPairs pairs : List.of(
+				AdditiveMethodMerger.HookPairs.NONE,
+				AdditiveMethodMerger.HookPairs.parse(List.of("pairElsewhere " + NEO + ".peek(I)V " + FORGE + ".peek(I)V")))) {
+			AdditiveMethodMerger.Result result = merge(vanilla, filtered(vanilla, NEO), filtered(vanilla, FORGE),
+					context(true, false, pairs));
+			assertFalse(result.accepted(), result.reason());
+			assertTrue(result.reason().startsWith("paired hooks align, but no runtime stand-down is reviewed: restoring "
+					+ FORGE + filter), result.reason());
+		}
+	}
+
+	@Test
+	void malformedPairTableRowsAreRejectedAndValidOnesParseInTheListedDirection() {
+		AdditiveMethodMerger.HookPairs pairs = AdditiveMethodMerger.HookPairs.parse(List.of("# comment", "  ",
+				"pairObserve " + NEO + ".observe(I)V " + FORGE + ".observe(I)V"));
+		assertEquals("pairObserve", pairs.pairId(NEO + ".observe(I)V", FORGE + ".observe(I)V"));
+		assertNull(pairs.pairId(FORGE + ".observe(I)V", NEO + ".observe(I)V"), "the key direction is base -> other");
+		assertNull(pairs.pairId(NEO + ".peek(I)V", FORGE + ".peek(I)V"));
+		for (String row : List.of(
+				"pairObserve " + NEO + ".observe(I)V",
+				"pairObserve " + NEO + ".observe(I)V " + FORGE + ".observe(I)V unexpected",
+				"pairObserve " + NEO + ".observe(I)V " + FORGE + ".peek(I)V",   // names differ
+				"pairObserve " + NEO + ".observe(I)V " + FORGE + ".observe()V", // descriptors differ
+				"pairObserve " + NEO + ".observe " + FORGE + ".observe(I)V",    // no descriptor
+				"pairObserve observe(I)V " + FORGE + ".observe(I)V",            // no owner
+				"pairObserve " + NEO + ".(I)V " + FORGE + ".(I)V",              // no name
+				"1pair " + NEO + ".observe(I)V " + FORGE + ".observe(I)V",      // not a method name
+				"pair/Observe " + NEO + ".observe(I)V " + FORGE + ".observe(I)V")) {
+			IllegalArgumentException rejected = assertThrows(IllegalArgumentException.class,
+					() -> AdditiveMethodMerger.HookPairs.parse(List.of(row)), row);
+			assertTrue(rejected.getMessage().contains("row 1"), rejected.getMessage());
+		}
+		String valid = "pairObserve " + NEO + ".observe(I)V " + FORGE + ".observe(I)V";
+		assertThrows(IllegalArgumentException.class, () -> AdditiveMethodMerger.HookPairs.parse(List.of(valid, valid)),
+				"the same pair twice");
+		assertThrows(IllegalArgumentException.class, () -> AdditiveMethodMerger.HookPairs.parse(List.of(valid,
+				"pairObserve " + NEO + ".peek(I)V " + FORGE + ".peek(I)V")), "the same pair id twice");
+	}
+
+	@Test
+	void theShippedPairTableIsPresentOnTheToolsClasspathAndEmpty() throws Exception {
+		InputStream in = AdditiveMethodMergerTest.class.getResourceAsStream("/net/forbric/tools/restored-hook-pairs.txt");
+		assertNotNull(in, "the merge tool ships net/forbric/tools/restored-hook-pairs.txt");
+		AdditiveMethodMerger.HookPairs shipped = AdditiveMethodMerger.HookPairs.parse(
+				new String(in.readAllBytes(), StandardCharsets.UTF_8).lines().toList());
+		assertTrue(shipped.isEmpty(), "this increment ships the mechanism only; reviewed pairs are enabled later");
+	}
+
+	@Test
+	void thePairTableDoesNotChangeEntryPrefixComposition() {
+		MethodNode vanilla = arithmetic();
+		AdditiveMethodMerger.HookPairs pairs = AdditiveMethodMerger.HookPairs.parse(
+				List.of("pairObserve " + NEO + ".observe(I)V " + FORGE + ".observe(I)V"));
+		AdditiveMethodMerger.Result accepted = merge(vanilla, prefix(vanilla, NEO), prefix(vanilla, FORGE),
+				context(true, true, pairs));
+		assertTrue(accepted.accepted(), accepted.reason());
+		assertEquals("exact vanilla body; entry hooks ordered base then other", accepted.reason());
+		// An entry prefix has no base-side call to retarget, so the table is never consulted for it.
+		AdditiveMethodMerger.Result unreviewed = merge(vanilla, prefix(vanilla, NEO), prefix(vanilla, FORGE),
+				context(true, false, pairs));
+		assertFalse(unreviewed.accepted(), unreviewed.reason());
+		assertTrue(unreviewed.reason().contains("no runtime stand-down is reviewed: restoring " + FORGE + ".observe(I)V"),
+				unreviewed.reason());
+	}
+
+	@Test
 	void hooksPostedAtDifferentVanillaStagesAreRefusedWhateverTheGrammar() {
 		// The fall-damage shape in miniature: vanilla clamps its argument into a local, then uses it. One family
 		// fires at entry with the raw argument, the other after the clamp with the local.
@@ -391,12 +588,21 @@ public class AdditiveMethodMergerTest {
 	static final AdditiveMethodMerger.Context PROBES = context(true, true);
 
 	static AdditiveMethodMerger.Context context(boolean resolves, boolean reviewed) {
+		return context(resolves, reviewed, AdditiveMethodMerger.HookPairs.NONE);
+	}
+
+	static AdditiveMethodMerger.Context context(boolean resolves, boolean reviewed, AdditiveMethodMerger.HookPairs pairs) {
 		return new AdditiveMethodMerger.Context() {
 			@Override public boolean resolvesStatic(String owner, String name, String descriptor) {
 				return resolves && (owner.equals(NEO) || owner.equals(FORGE));
 			}
 
 			@Override public boolean reviewed(MethodInsnNode alongside, MethodInsnNode restored) { return reviewed; }
+
+			@Override public String facadePair(MethodInsnNode alongside, MethodInsnNode restored) {
+				return pairs.pairId(alongside.owner + "." + alongside.name + alongside.desc,
+						restored.owner + "." + restored.name + restored.desc);
+			}
 		};
 	}
 
@@ -460,6 +666,22 @@ public class AdditiveMethodMergerTest {
 		return result;
 	}
 
+	/** arithmetic() with the family's observer after the literal and AGAIN after that call: one pair, two sites. */
+	static MethodNode pairedTwice(MethodNode vanilla, String family) {
+		MethodNode result = copy(vanilla);
+		result.instructions.insert(executable(result).get(1), site(family, "observe", "(I)V", new VarInsnNode(Opcodes.ILOAD, 0)));
+		result.instructions.insert(executable(result).get(3), site(family, "observe", "(I)V", new VarInsnNode(Opcodes.ILOAD, 0)));
+		return result;
+	}
+
+	/** arithmetic() with the family's observe(I)V after the literal and its peek(I)V after that: two pairs. */
+	static MethodNode pairedDistinct(MethodNode vanilla, String family) {
+		MethodNode result = copy(vanilla);
+		result.instructions.insert(executable(result).get(1), site(family, "observe", "(I)V", new VarInsnNode(Opcodes.ILOAD, 0)));
+		result.instructions.insert(executable(result).get(3), site(family, "peek", "(I)V", new VarInsnNode(Opcodes.ILOAD, 0)));
+		return result;
+	}
+
 	/** {@code int choose(Optional found)}: the shape of BaseFireBlock's portal consumer. */
 	static MethodNode choosing() {
 		MethodNode method = new MethodNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC, "choose", "(Ljava/util/Optional;)I", null, null);
@@ -502,6 +724,19 @@ public class AdditiveMethodMergerTest {
 		return out;
 	}
 
+	/** Opcode per executable instruction, with the variable slot or call target when it has one. */
+	static List<String> shapes(MethodNode method) {
+		List<String> out = new ArrayList<>();
+		for (AbstractInsnNode instruction : method.instructions) {
+			if (instruction.getOpcode() < 0) continue;
+			String op = org.objectweb.asm.util.Printer.OPCODES[instruction.getOpcode()];
+			if (instruction instanceof VarInsnNode variable) out.add(op + " " + variable.var);
+			else if (instruction instanceof MethodInsnNode call) out.add(op + " " + call.owner + "." + call.name);
+			else out.add(op);
+		}
+		return out;
+	}
+
 	static byte[] classBytes(String name, MethodNode method) {
 		ClassWriter writer = new ClassWriter(ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS);
 		writer.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, name, null, "java/lang/Object", null);
@@ -527,12 +762,64 @@ public class AdditiveMethodMergerTest {
 	}
 
 	private static Class<?> load(String owner, byte[] bytes) {
+		return load(owner, bytes, false);
+	}
+
+	private static Class<?> load(String owner, byte[] bytes, boolean facade) {
 		class Loader extends ClassLoader {
 			Class<?> define(String name, byte[] bytes) { return defineClass(name.replace('/', '.'), bytes, 0, bytes.length); }
 		}
 		Loader loader = new Loader();
 		for (String family : List.of(NEO, FORGE)) loader.define(family, hookClass(family));
+		if (facade) loader.define(AdditiveMethodMerger.COMPOSED_HOOK_FACADE, composedHookClass());
 		return loader.define(owner, bytes);
+	}
+
+	/** Runs a facade-composed {@code compute} with the kernel facade defined beside the probe families. */
+	private static Object invokeFacade(MethodNode method, int value) throws Exception {
+		return load("Example", classBytes("Example", method), true).getMethod("compute", int.class).invoke(null, value);
+	}
+
+	/** Runs a facade-composed {@code choose} with the kernel facade defined beside the probe families. */
+	static int chooseFacade(byte[] bytes, Optional<?> found) throws Exception {
+		return (int) load("Example", bytes, true).getMethod("choose", Optional.class).invoke(null, found);
+	}
+
+	/**
+	 * The kernel facade as its contract describes it, for the two probe pairs: each pair method performs the
+	 * base family's hook, repeats the Optional refusal guard when the result threads through a local, and only
+	 * then performs the other family's. The dispatch scope itself is kernel machinery the probes do not model.
+	 */
+	static byte[] composedHookClass() {
+		MethodNode pairObserve = new MethodNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC, "pairObserve", "(I)V", null, null);
+		pairObserve.instructions.add(new VarInsnNode(Opcodes.ILOAD, 0));
+		pairObserve.instructions.add(new MethodInsnNode(Opcodes.INVOKESTATIC, NEO, "observe", "(I)V", false));
+		pairObserve.instructions.add(new VarInsnNode(Opcodes.ILOAD, 0));
+		pairObserve.instructions.add(new MethodInsnNode(Opcodes.INVOKESTATIC, FORGE, "observe", "(I)V", false));
+		pairObserve.instructions.add(new InsnNode(Opcodes.RETURN));
+		MethodNode pairFilter = new MethodNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC, "pairFilter",
+				"(Ljava/util/Optional;)Ljava/util/Optional;", null, null);
+		LabelNode answered = new LabelNode();
+		pairFilter.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+		pairFilter.instructions.add(new MethodInsnNode(Opcodes.INVOKESTATIC, NEO, "filter",
+				"(Ljava/util/Optional;)Ljava/util/Optional;", false));
+		pairFilter.instructions.add(new VarInsnNode(Opcodes.ASTORE, 1));
+		pairFilter.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+		pairFilter.instructions.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, "java/util/Optional", "isPresent", "()Z", false));
+		pairFilter.instructions.add(new JumpInsnNode(Opcodes.IFEQ, answered));
+		pairFilter.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+		pairFilter.instructions.add(new MethodInsnNode(Opcodes.INVOKESTATIC, FORGE, "filter",
+				"(Ljava/util/Optional;)Ljava/util/Optional;", false));
+		pairFilter.instructions.add(new VarInsnNode(Opcodes.ASTORE, 1));
+		pairFilter.instructions.add(answered);
+		pairFilter.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+		pairFilter.instructions.add(new InsnNode(Opcodes.ARETURN));
+		ClassWriter writer = new ClassWriter(ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS);
+		writer.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, AdditiveMethodMerger.COMPOSED_HOOK_FACADE, null, "java/lang/Object", null);
+		pairObserve.accept(writer);
+		pairFilter.accept(writer);
+		writer.visitEnd();
+		return writer.toByteArray();
 	}
 
 	/** A probe family's hook owner: observe(I)V records, filter(Optional)Optional records and may refuse. */
